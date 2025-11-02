@@ -1,0 +1,19 @@
+[project]
+name = "po-minibot"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "opencv-python",
+  "pynput",
+  "pyautogui",
+  "pillow",
+]
+
+[project.scripts]
+minibot = "src.bot_controller:run_bot"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
