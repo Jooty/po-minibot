@@ -85,41 +85,84 @@ def find_dirty_areas(current_img, clean_img):
     
     return dirty_regions, cleaned
 
+def merge_nearby_segments(segments, merge_distance=30):
+    """Merge nearby dirty segments to reduce redundant scrubbing."""
+    if not segments:
+        return []
+    
+    # Sort segments by left position.
+    sorted_segments = sorted(segments, key=lambda s: s['left'])
+    merged = []
+    current = sorted_segments[0]
+    
+    for next_segment in sorted_segments[1:]:
+        # Check if segments are close enough to merge.
+        gap = next_segment['left'] - current['right']
+        if gap <= merge_distance:
+            # Merge segments.
+            current['right'] = max(current['right'], next_segment['right'])
+            current['width'] = current['right'] - current['left']
+        else:
+            # Save current segment and start new one.
+            merged.append(current)
+            current = next_segment
+    
+    # Don't forget the last segment.
+    merged.append(current)
+    return merged
+
 def analyze_dirty_rows(dirty_regions, board_shape):
-    """Analyze which of the 10 horizontal rows contain dirt and need scrubbing."""
+    """Analyze which of the 10 horizontal rows contain dirt and create scrub segments for each dirty area."""
     board_h, board_w = board_shape[:2]
     num_rows = 10
     row_height = board_h // num_rows
     
-    # Initialize row dirt tracking.
+    # Initialize row dirt tracking with segments.
     dirty_rows = []
     
     for row_idx in range(num_rows):
+        # Skip top row (0) and bottom row (9) - only scrub middle rows 1-8.
+        if row_idx == 0 or row_idx == (num_rows - 1):
+            continue
+            
         row_top = row_idx * row_height
         row_bottom = row_top + row_height
-        row_has_dirt = False
+        row_dirty_segments = []
         
-        # Check if any dirty regions intersect with this row.
+        # Find all dirty regions that intersect with this row.
         for x, y, w, h in dirty_regions:
             region_top = y
             region_bottom = y + h
+            region_left = x
+            region_right = x + w
             
             # Check for vertical overlap between region and row.
             if not (region_bottom <= row_top or region_top >= row_bottom):
-                row_has_dirt = True
-                break
-        
-        if row_has_dirt:
-            # Skip top row (0) and bottom row (9) - only scrub middle rows 1-8.
-            if row_idx != 0 and row_idx != (num_rows - 1):
-                dirty_rows.append({
-                    'row_idx': row_idx,
-                    'top': row_top,
-                    'bottom': row_bottom,
-                    'center_y': row_top + row_height // 2,
-                    'height': row_height,
-                    'width': board_w
+                # Add horizontal segment for this dirty region.
+                # Add some margin around the dirty area for better coverage.
+                margin = 20
+                segment_left = max(0, region_left - margin)
+                segment_right = min(board_w, region_right + margin)
+                
+                row_dirty_segments.append({
+                    'left': segment_left,
+                    'right': segment_right,
+                    'width': segment_right - segment_left
                 })
+        
+        if row_dirty_segments:
+            # Merge overlapping segments.
+            merged_segments = merge_nearby_segments(row_dirty_segments)
+            
+            dirty_rows.append({
+                'row_idx': row_idx,
+                'top': row_top,
+                'bottom': row_bottom,
+                'center_y': row_top + row_height // 2,
+                'height': row_height,
+                'width': board_w,
+                'dirty_segments': merged_segments
+            })
     
     return dirty_rows
 
@@ -166,8 +209,8 @@ def perform_row_scrub(row):
         pyautogui.moveTo(right_x, y_pos, duration=0.001)
         pyautogui.moveTo(left_x, y_pos, duration=0.001)
 
-def perform_continuous_scrub_row(row, power_tracker):
-    """Perform continuous bidirectional scrub with intermittent power when available."""
+def perform_continuous_scrub_row(row, power_tracker, row_idx):
+    """Perform continuous bidirectional scrub only on dirty segments within the row."""
     from src.utils import require_display
     require_display()
     _ensure_no_pyautogui_delays() 
@@ -175,35 +218,93 @@ def perform_continuous_scrub_row(row, power_tracker):
     
     # Convert row coordinates to screen coordinates.
     x1, y1 = SCRUB_BOARD_TOPLEFT
-    left_x = x1 + 10  
-    right_x = x1 + row['width'] - 10
     scrub_y = y1 + row['center_y']
     
-    # Start at left side.
-    teleport_to(left_x, scrub_y)
-    
-    # Check if power is available and use it if so.
-    use_power = power_tracker.can_use_power()
-    if use_power:
-        power_tracker.start_power_use()
-        pyautogui.mouseDown()
-    
-    # Move left to right.
-    pyautogui.moveTo(right_x, scrub_y, duration=0.001)
-    
-    # Immediately move right to left (no delay).
-    pyautogui.moveTo(left_x, scrub_y, duration=0.001)
-    
-    if use_power:
-        pyautogui.mouseUp()
-        power_tracker.end_power_use()
+    # Scrub each dirty segment in this row.
+    for seg_idx, segment in enumerate(row['dirty_segments']):
+        segment_left = x1 + segment['left']
+        segment_right = x1 + segment['right']
+        
+        # Start at left side of dirty segment.
+        teleport_to(segment_left, scrub_y)
+        
+        # Check if this segment should use power based on fair distribution.
+        use_power = power_tracker.should_use_power_for_segment(row_idx, seg_idx)
+        if use_power:
+            power_tracker.start_power_use(row_idx, seg_idx)
+            pyautogui.mouseDown()
+        
+        # Scrub left to right across the dirty segment.
+        pyautogui.moveTo(segment_right, scrub_y, duration=0.001)
+        
+        # Immediately scrub right to left across the dirty segment.
+        pyautogui.moveTo(segment_left, scrub_y, duration=0.001)
+        
+        if use_power:
+            pyautogui.mouseUp()
+            power_tracker.end_power_use()
+            # Wait for power to recharge - keep the 0.6s recharge time.
+            time.sleep(0.6)  # Slightly longer than recharge to ensure power is ready.
+        else:
+            # Minimal pause between segments when not using power for speed.
+            time.sleep(0.05)
 
 class PowerTracker:
-    """Track power availability and usage without blocking movement."""
+    """Track power availability and distribute usage evenly across segments."""
     def __init__(self):
         self.last_power_end = 0
         self.power_duration = 0.5  # Power lasts 0.5 seconds.
         self.recharge_duration = 1.0  # Takes 1 second to recharge.
+        self.segment_power_schedule = []  # Queue of segments that should get power.
+        self.segments_used_power = set()  # Track which segments have used power this cycle.
+        
+    def schedule_power_for_segments(self, all_segments):
+        """Create a randomized schedule for power usage across all segments."""
+        import random
+        
+        # Create a list of all segment identifiers.
+        segment_ids = []
+        for row_idx, row in enumerate(all_segments):
+            for seg_idx, segment in enumerate(row.get('dirty_segments', [])):
+                segment_ids.append((row_idx, seg_idx))
+        
+        # Shuffle the segments to randomize power distribution.
+        random.shuffle(segment_ids)
+        
+        # Reset tracking.
+        self.segment_power_schedule = segment_ids
+        self.segments_used_power = set()
+        
+        print(f"[SCRUBBING] Scheduled power for {len(segment_ids)} segments in random order")
+    
+    def should_use_power_for_segment(self, row_idx, seg_idx):
+        """Check if this specific segment should use power now."""
+        segment_id = (row_idx, seg_idx)
+        
+        # Check if power is available.
+        if not self.can_use_power():
+            return False
+        
+        # Use power much more aggressively - aim for ~80% usage rate.
+        # Only skip if this segment has used power recently in this cycle.
+        if segment_id in self.segments_used_power:
+            # Give it another chance if we haven't distributed much power yet.
+            total_segments = len(self.segment_power_schedule) + len(self.segments_used_power)
+            used_ratio = len(self.segments_used_power) / max(1, total_segments)
+            
+            # Allow re-use if we're still early in the cycle.
+            import random
+            if used_ratio < 0.5:  # Less than half the segments have been powered.
+                return random.random() < 0.3  # 30% chance to re-use power.
+            return False
+        
+        # Check if this segment is next in the schedule - high priority.
+        if self.segment_power_schedule and self.segment_power_schedule[0] == segment_id:
+            return True
+        
+        # Use power very frequently - 85% chance for any segment that hasn't used it.
+        import random
+        return random.random() < 0.85
         
     def can_use_power(self):
         """Check if power is available (non-blocking)."""
@@ -211,10 +312,19 @@ class PowerTracker:
         time_since_last_power = current_time - self.last_power_end
         return time_since_last_power >= self.recharge_duration
     
-    def start_power_use(self):
-        """Mark the start of power usage."""
-        # Power will end after 0.5 seconds from now.
+    def start_power_use(self, row_idx, seg_idx):
+        """Mark the start of power usage for a specific segment."""
+        segment_id = (row_idx, seg_idx)
+        
+        # Remove from schedule if it was scheduled.
+        if self.segment_power_schedule and self.segment_power_schedule[0] == segment_id:
+            self.segment_power_schedule.pop(0)
+        
+        # Mark as used.
+        self.segments_used_power.add(segment_id)
         self.power_start_time = time.time()
+        
+        print(f"[SCRUBBING] Using power on segment {segment_id}")
         
     def end_power_use(self):
         """Mark the end of power usage and start recharge timer."""
@@ -236,13 +346,16 @@ def scrub_dirty_areas(dirty_regions, board_shape):
     # Initialize power tracker.
     power_tracker = PowerTracker()
     
+    # Schedule power usage across all segments for fair distribution.
+    power_tracker.schedule_power_for_segments(dirty_rows)
+    
     # Scrub ONLY the dirty rows continuously.
     for i, row in enumerate(dirty_rows):
         if not bot_state.RUNNING or bot_state.current_state != STATE_SCRUBBING:
             break
 
-        # Perform continuous scrub with power when available.
-        perform_continuous_scrub_row(row, power_tracker)
+        # Perform continuous scrub with fair power distribution.
+        perform_continuous_scrub_row(row, power_tracker, i)
     
     return True
 
